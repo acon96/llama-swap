@@ -300,6 +300,13 @@ models:
       tlsHandshake: 10
       idleConn: 90
 
+    # stashKVCacheOnExit: save the model's KV cache to /dev/shm/llama-swap/{model_id}.kv
+    #   when the process stops and restore it when the process starts again.
+    # - optional, default: false
+    # - requires llama-server started with --slot-save-path /dev/shm/llama-swap
+    # - cache files are deleted when they exceed 3x the model's TTL
+    stashKVCacheOnExit: false
+
   # Unlisted model example:
   "qwen-unlisted":
     # unlisted: boolean, true or false

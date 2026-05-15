@@ -82,6 +82,9 @@ type Process struct {
 
 	// track the number of failed starts
 	failedStartCount int
+
+	// KV cache manager for saving/restoring slot caches
+	kvCache *kvCacheManager
 }
 
 func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *LogMonitor, proxyLogger *LogMonitor) *Process {
@@ -126,7 +129,7 @@ func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, pr
 		}
 	}
 
-	return &Process{
+	p := &Process{
 		ID:                      ID,
 		config:                  config,
 		cmd:                     nil,
@@ -145,6 +148,14 @@ func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, pr
 		// stop timeout
 		gracefulStopTimeout: 10 * time.Second,
 		cmdWaitChan:         make(chan struct{}),
+	}
+	p.initKVCache()
+	return p
+}
+
+func (p *Process) initKVCache() {
+	if p.config.StashKVCacheOnExit {
+		p.kvCache = newKVCacheManager(p.ID, p.config.Proxy, p.config.UnloadAfter, p.proxyLogger)
 	}
 }
 
@@ -426,6 +437,12 @@ func (p *Process) start() error {
 		return fmt.Errorf("failed to set Process state to ready: current state: %v, error: %v", curState, err)
 	} else {
 		p.failedStartCount = 0
+		// Restore KV cache after process is ready
+		if p.kvCache != nil {
+			if err := p.kvCache.restore(); err != nil {
+				p.proxyLogger.Warnf("<%s> kvcache: restore failed: %v", p.ID, err)
+			}
+		}
 		return nil
 	}
 }
@@ -442,6 +459,16 @@ func (p *Process) Stop() {
 	// wait for any inflight requests before proceeding
 	p.proxyLogger.Debugf("<%s> Stop(): Waiting for inflight requests to complete", p.ID)
 	p.inFlightRequests.Wait()
+
+	// Save KV cache before stopping (process still running at this point)
+	if p.kvCache != nil {
+		if err := p.kvCache.save(); err != nil {
+			p.proxyLogger.Warnf("<%s> kvcache: save failed: %v", p.ID, err)
+		}
+		// Stop the periodic cleanup goroutine
+		p.kvCache.Stop()
+	}
+
 	p.StopImmediately()
 }
 
@@ -472,6 +499,11 @@ func (p *Process) StopImmediately() {
 func (p *Process) Shutdown() {
 	if !isValidTransition(p.CurrentState(), StateStopping) {
 		return
+	}
+
+	// Stop the periodic cleanup goroutine
+	if p.kvCache != nil {
+		p.kvCache.Stop()
 	}
 
 	p.stopCommand()

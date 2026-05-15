@@ -54,6 +54,10 @@ type ModelConfig struct {
 
 	// Timeout settings for proxy connections
 	Timeouts TimeoutsConfig `yaml:"timeouts"`
+
+	// StashKVCacheOnExit when true, saves the KV cache to /dev/shm/llama-swap/{model_id}.kv
+	// when the process stops and restores it when the process starts.
+	StashKVCacheOnExit bool `yaml:"stashKVCacheOnExit"`
 }
 
 func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
