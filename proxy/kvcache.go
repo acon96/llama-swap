@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +15,12 @@ import (
 	"time"
 )
 
-const kvCacheDir = "/dev/shm/llama-swap"
+var kvCacheDir = "/dev/shm/llama-swap"
+
+const (
+	kvCacheFilePrefix      = "stash-"
+	kvCacheManifestVersion = 1
+)
 
 // kvCacheManager handles saving, restoring, and cleaning up KV cache slot files
 // for a llama-server process via the slot save/restore API endpoints.
@@ -54,13 +61,13 @@ type slotNextToken struct {
 
 // slotInfo represents a slot returned by the /slots endpoint
 type slotInfo struct {
-	ID           int             `json:"id"`
-	NCtx         int             `json:"n_ctx"`
-	Speculative  bool            `json:"speculative"`
-	IsProcessing bool            `json:"is_processing"`
-	IDTask       int             `json:"id_task"`
-	Params       slotParams      `json:"params"`
-	NextToken    []slotNextToken `json:"next_token"`
+	ID           int           `json:"id"`
+	NCtx         int           `json:"n_ctx"`
+	Speculative  bool          `json:"speculative"`
+	IsProcessing bool          `json:"is_processing"`
+	IDTask       int           `json:"id_task"`
+	Params       slotParams    `json:"params"`
+	NextToken    slotNextToken `json:"next_token"`
 }
 
 // slotsResponse represents the response from the /slots endpoint
@@ -96,6 +103,21 @@ type restoreResponse struct {
 	Timings   struct {
 		RestoreMS float64 `json:"restore_ms"`
 	} `json:"timings"`
+}
+
+type kvCacheManifest struct {
+	Version     int                   `json:"version"`
+	ModelID     string                `json:"model_id"`
+	Fingerprint string                `json:"fingerprint"`
+	SavedAt     time.Time             `json:"saved_at"`
+	Slots       []kvCacheManifestSlot `json:"slots"`
+}
+
+type kvCacheManifestSlot struct {
+	SlotID      int    `json:"slot_id"`
+	Filename    string `json:"filename"`
+	NCtx        int    `json:"n_ctx"`
+	Speculative bool   `json:"speculative"`
 }
 
 func newKVCacheManager(modelID, proxyURL string, ttl int, logger *LogMonitor) *kvCacheManager {
@@ -175,13 +197,8 @@ func (m *kvCacheManager) Stop() {
 	<-m.doneChan
 }
 
-// cacheFile returns the path to the cache file for this model
-func (m *kvCacheManager) cacheFile() string {
-	return filepath.Join(kvCacheDir, m.modelID+".kv")
-}
-
-// listSlots queries the llama-server for available slot IDs
-func (m *kvCacheManager) listSlots() ([]int, error) {
+// listSlots queries the llama-server for current slot state.
+func (m *kvCacheManager) listSlots() ([]slotInfo, error) {
 	url := m.proxyURL + "/slots"
 	resp, err := m.httpClient.Get(url)
 	if err != nil {
@@ -199,16 +216,11 @@ func (m *kvCacheManager) listSlots() ([]int, error) {
 		return nil, fmt.Errorf("failed to decode slots response: %w", err)
 	}
 
-	ids := make([]int, 0, len(slots))
-	for _, s := range slots {
-		ids = append(ids, s.ID)
-	}
-	return ids, nil
+	return slots, nil
 }
 
 // saveSlot saves a single slot's KV cache to a file
-func (m *kvCacheManager) saveSlot(slotID int) error {
-	filename := m.modelID + ".kv"
+func (m *kvCacheManager) saveSlot(slotID int, filename string) error {
 	req, err := m.newSlotActionRequest(slotID, "save", saveRequest{Filename: filename})
 	if err != nil {
 		return fmt.Errorf("failed to create save request for slot %d: %w", slotID, err)
@@ -236,8 +248,7 @@ func (m *kvCacheManager) saveSlot(slotID int) error {
 }
 
 // restoreSlot restores a single slot's KV cache from a file
-func (m *kvCacheManager) restoreSlot(slotID int) error {
-	filename := m.modelID + ".kv"
+func (m *kvCacheManager) restoreSlot(slotID int, filename string) error {
 	req, err := m.newSlotActionRequest(slotID, "restore", restoreRequest{Filename: filename})
 	if err != nil {
 		return fmt.Errorf("failed to create restore request for slot %d: %w", slotID, err)
@@ -264,6 +275,70 @@ func (m *kvCacheManager) restoreSlot(slotID int) error {
 	return nil
 }
 
+func (m *kvCacheManager) fingerprint(slots []slotInfo) string {
+	hash := sha256.New()
+	_, _ = io.WriteString(hash, m.modelID)
+	for _, slot := range slots {
+		_, _ = io.WriteString(hash, fmt.Sprintf("|%d:%d:%t", slot.ID, slot.NCtx, slot.Speculative))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func (m *kvCacheManager) manifestFilename(fingerprint string) string {
+	return fmt.Sprintf("%s%s.json", kvCacheFilePrefix, fingerprint)
+}
+
+func (m *kvCacheManager) slotFilename(fingerprint string, slotID int) string {
+	return fmt.Sprintf("%s%s-slot-%d.kv", kvCacheFilePrefix, fingerprint, slotID)
+}
+
+func (m *kvCacheManager) manifestPath(fingerprint string) string {
+	return filepath.Join(kvCacheDir, m.manifestFilename(fingerprint))
+}
+
+func (m *kvCacheManager) writeManifest(manifest kvCacheManifest) error {
+	manifestPath := m.manifestPath(manifest.Fingerprint)
+	tempPath := manifestPath + ".tmp"
+
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("failed to marshal manifest: %w", err)
+	}
+
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write manifest temp file: %w", err)
+	}
+
+	if err := os.Rename(tempPath, manifestPath); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to rename manifest temp file: %w", err)
+	}
+
+	return nil
+}
+
+func (m *kvCacheManager) readManifest(fingerprint string) (*kvCacheManifest, error) {
+	manifestPath := m.manifestPath(fingerprint)
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read manifest: %w", err)
+	}
+
+	var manifest kvCacheManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("failed to decode manifest: %w", err)
+	}
+
+	if manifest.Version != kvCacheManifestVersion || manifest.ModelID != m.modelID || manifest.Fingerprint != fingerprint {
+		return nil, nil
+	}
+
+	return &manifest, nil
+}
+
 // save saves all available slots to the cache file
 func (m *kvCacheManager) save() error {
 	slots, err := m.listSlots()
@@ -281,10 +356,37 @@ func (m *kvCacheManager) save() error {
 		return fmt.Errorf("failed to create cache directory %s: %w", kvCacheDir, err)
 	}
 
-	for _, slotID := range slots {
-		if err := m.saveSlot(slotID); err != nil {
-			m.logger.Warnf("<%s> kvcache: failed to save slot %d: %v", m.modelID, slotID, err)
+	fingerprint := m.fingerprint(slots)
+	manifest := kvCacheManifest{
+		Version:     kvCacheManifestVersion,
+		ModelID:     m.modelID,
+		Fingerprint: fingerprint,
+		SavedAt:     time.Now().UTC(),
+		Slots:       make([]kvCacheManifestSlot, 0, len(slots)),
+	}
+
+	for _, slot := range slots {
+		filename := m.slotFilename(fingerprint, slot.ID)
+		if err := m.saveSlot(slot.ID, filename); err != nil {
+			m.logger.Warnf("<%s> kvcache: failed to save slot %d: %v", m.modelID, slot.ID, err)
+			continue
 		}
+
+		manifest.Slots = append(manifest.Slots, kvCacheManifestSlot{
+			SlotID:      slot.ID,
+			Filename:    filename,
+			NCtx:        slot.NCtx,
+			Speculative: slot.Speculative,
+		})
+	}
+
+	if len(manifest.Slots) == 0 {
+		m.logger.Debugf("<%s> kvcache: no slots were saved successfully", m.modelID)
+		return nil
+	}
+
+	if err := m.writeManifest(manifest); err != nil {
+		return fmt.Errorf("failed to write stash manifest: %w", err)
 	}
 
 	// Run cleanup after saving
@@ -295,11 +397,6 @@ func (m *kvCacheManager) save() error {
 
 // restore attempts to restore the cache file to available slots
 func (m *kvCacheManager) restore() error {
-	cacheFile := m.cacheFile()
-	if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
-		return nil // no cache file yet, nothing to restore
-	}
-
 	slots, err := m.listSlots()
 	if err != nil {
 		return fmt.Errorf("list slots before restore: %w", err)
@@ -309,9 +406,35 @@ func (m *kvCacheManager) restore() error {
 		return nil
 	}
 
-	// Restore to the first available slot
-	if err := m.restoreSlot(slots[0]); err != nil {
-		m.logger.Warnf("<%s> kvcache: failed to restore to slot %d: %v", m.modelID, slots[0], err)
+	fingerprint := m.fingerprint(slots)
+	manifest, err := m.readManifest(fingerprint)
+	if err != nil {
+		return fmt.Errorf("read manifest before restore: %w", err)
+	}
+	if manifest == nil {
+		return nil
+	}
+
+	slotsByID := make(map[int]slotInfo, len(slots))
+	for _, slot := range slots {
+		slotsByID[slot.ID] = slot
+	}
+
+	for _, savedSlot := range manifest.Slots {
+		currentSlot, ok := slotsByID[savedSlot.SlotID]
+		if !ok {
+			m.logger.Warnf("<%s> kvcache: skipping restore for missing slot %d", m.modelID, savedSlot.SlotID)
+			continue
+		}
+
+		if currentSlot.NCtx != savedSlot.NCtx || currentSlot.Speculative != savedSlot.Speculative {
+			m.logger.Warnf("<%s> kvcache: skipping restore for slot %d due to incompatible slot shape", m.modelID, savedSlot.SlotID)
+			continue
+		}
+
+		if err := m.restoreSlot(savedSlot.SlotID, savedSlot.Filename); err != nil {
+			m.logger.Warnf("<%s> kvcache: failed to restore to slot %d: %v", m.modelID, savedSlot.SlotID, err)
+		}
 	}
 
 	return nil
@@ -336,7 +459,7 @@ func (m *kvCacheManager) cleanup() {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasSuffix(name, ".kv") {
+		if !strings.HasPrefix(name, kvCacheFilePrefix) {
 			continue
 		}
 
@@ -365,20 +488,20 @@ func (m *kvCacheManager) eraseAll() error {
 	}
 
 	for _, slotID := range slots {
-		req, err := m.newSlotActionRequest(slotID, "erase", nil)
+		req, err := m.newSlotActionRequest(slotID.ID, "erase", nil)
 		if err != nil {
-			m.logger.Warnf("<%s> kvcache: failed to create erase request for slot %d: %v", m.modelID, slotID, err)
+			m.logger.Warnf("<%s> kvcache: failed to create erase request for slot %d: %v", m.modelID, slotID.ID, err)
 			continue
 		}
 
 		resp, err := m.httpClient.Do(req)
 		if err != nil {
-			m.logger.Warnf("<%s> kvcache: failed to erase slot %d: %v", m.modelID, slotID, err)
+			m.logger.Warnf("<%s> kvcache: failed to erase slot %d: %v", m.modelID, slotID.ID, err)
 			continue
 		}
 		resp.Body.Close()
 
-		m.logger.Debugf("<%s> kvcache: erased slot %d", m.modelID, slotID)
+		m.logger.Debugf("<%s> kvcache: erased slot %d", m.modelID, slotID.ID)
 	}
 
 	return nil

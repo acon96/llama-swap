@@ -160,6 +160,16 @@ func (p *Process) initKVCache() {
 	}
 }
 
+func (p *Process) saveKVCache() {
+	if p.kvCache == nil {
+		return
+	}
+
+	if err := p.kvCache.save(); err != nil {
+		p.proxyLogger.Warnf("<%s> kvcache: save failed: %v", p.ID, err)
+	}
+}
+
 // LogMonitor returns the log monitor associated with the process.
 func (p *Process) LogMonitor() *logmon.Monitor {
 	return p.processLogger
@@ -462,13 +472,7 @@ func (p *Process) Stop() {
 	p.inFlightRequests.Wait()
 
 	// Save KV cache before stopping (process still running at this point)
-	if p.kvCache != nil {
-		if err := p.kvCache.save(); err != nil {
-			p.proxyLogger.Warnf("<%s> kvcache: save failed: %v", p.ID, err)
-		}
-		// Stop the periodic cleanup goroutine
-		p.kvCache.Stop()
-	}
+	p.saveKVCache()
 
 	p.StopImmediately()
 }
@@ -501,6 +505,8 @@ func (p *Process) Shutdown() {
 	if !isValidTransition(p.CurrentState(), StateStopping) {
 		return
 	}
+
+	p.saveKVCache()
 
 	// Stop the periodic cleanup goroutine
 	if p.kvCache != nil {
